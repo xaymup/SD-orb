@@ -1,0 +1,44 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+bin/
+lib/
+share/
+include/
+
+# Models and Engines
+models/
+engines/
+*.engine
+*.onnx
+*.data
+*.safetensors
+*.bin
+*.pth
+
+# Python Caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs
+.vscode/
+.idea/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Project specific artifacts
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.tar.gz
+repomix-output.xml
+.repomixignore
+test_*.py
+verify_stream.py
+inspect_engine.py
+builder.py
