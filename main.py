@@ -134,6 +134,7 @@ with dpg.window(label="113.RECURSIVE AI — Modular RV6", width=900, height=650)
                 dpg.add_slider_float(label="Temporal Smooth", tag="delta_sl",    min_value=0.0, max_value=0.98, default_value=0.85)
 
                 with dpg.collapsing_header(label="Feedback Engine", default_open=True):
+                    dpg.add_slider_float(label="Audio Smooth",   tag="audio_smooth_sl", min_value=0.0, max_value=0.99, default_value=0.7)
                     dpg.add_slider_float(label="Zoom Base",      tag="zoom_base_sl",  min_value=0.8, max_value=1.1,  default_value=0.98)
                     dpg.add_slider_float(label="Zoom React",    tag="zoom_sens_sl",  min_value=0.0, max_value=2.0,  default_value=1.0)
                     dpg.add_slider_float(label="Rotate Base",    tag="rot_base_sl",   min_value=-0.1, max_value=0.1, default_value=0.01)
@@ -158,6 +159,7 @@ while dpg.is_dearpygui_running():
         next_prompt()
 
     # 1. Audio
+    audio.smoothing_factor = dpg.get_value("audio_smooth_sl")
     bands = audio.get_bands()
     
     # 2. Visualization (Recursive Feedback)

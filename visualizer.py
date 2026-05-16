@@ -27,33 +27,29 @@ class Visualizer:
         rot_base  = config['rot_base']
         rot_sens  = config['rot_sens']
 
-        # 1. Transform back to 0-255 uint8 for Pygame processing
+        # 1. Transform back to 0-255 uint8 for OpenCV processing
         # input_array is (H, W, 3) RGB
         frame_uint8 = (input_array * 255).astype(np.uint8)
         
-        # 2. Setup Pygame surfaces for the warp
-        # We need to transpose for Pygame (W, H, 3)
-        surf = pygame.surfarray.make_surface(frame_uint8.transpose(1, 0, 2))
-        
-        # 3. Calculate Warp
+        # 2. Calculate Warp
         zoom = zoom_base - (bass * 0.05 * zoom_sens)
         rot = rot_base + (mids * 0.05 * rot_sens)
         
         new_r = self.R * zoom
         new_ang = self.ANG + rot
 
-        map_x = np.clip(((np.cos(new_ang) * new_r + 1.0) * (self.width / 2)), 0, self.width - 1).astype(np.int32)
-        map_y = np.clip(((np.sin(new_ang) * new_r + 1.0) * (self.height / 2)), 0, self.height - 1).astype(np.int32)
+        map_x = ((np.cos(new_ang) * new_r + 1.0) * (self.width / 2)).astype(np.float32)
+        map_y = ((np.sin(new_ang) * new_r + 1.0) * (self.height / 2)).astype(np.float32)
 
-        # 4. Apply warp
-        px_data = pygame.surfarray.array3d(surf)
-        warped_data = px_data[map_x, map_y]
+        # 3. Apply warp using OpenCV for bilinear interpolation (much smoother)
+        warped_data = cv2.remap(frame_uint8, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
         
-        # 5. Decay
+        # 4. Decay
         decay = 0.92 + (highs * 0.06)
         warped_data = (warped_data * decay).astype(np.uint8)
 
-        # 6. Re-create surface and draw geometry
+        # 5. Re-create surface and draw geometry
+        # Transpose for Pygame: (H, W, 3) -> (W, H, 3)
         warped_surf = pygame.surfarray.make_surface(warped_data.transpose(1, 0, 2))
         
         self._angle_accumulator += 0.02 + bass * 0.05
@@ -65,5 +61,5 @@ class Visualizer:
             color = (r_c, 100, 255)
             pygame.draw.rect(warped_surf, color, (cx - dist, cy - dist, dist * 2, dist * 2), 1)
 
-        # 7. Convert back to normalized float32 (H, W, 3)
+        # 6. Convert back to normalized float32 (H, W, 3)
         return np.transpose(pygame.surfarray.array3d(warped_surf), (1, 0, 2)).astype(np.float32) / 255.0

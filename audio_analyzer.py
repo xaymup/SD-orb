@@ -8,6 +8,10 @@ class AudioAnalyzer:
         self.pa = pyaudio.PyAudio()
         self.stream = None
         self.try_open_stream()
+        
+        # Smoothing state
+        self.smoothed_bands = np.array([0.0, 0.0, 0.0])
+        self.smoothing_factor = 0.7  # 0.0 = no smoothing, 1.0 = static
 
     def try_open_stream(self):
         try:
@@ -35,7 +39,12 @@ class AudioAnalyzer:
             bass  = min(np.mean(fft[:8])   / 12000, 1.5)
             mids  = min(np.mean(fft[8:60]) / 6000,  1.5)
             highs = min(np.mean(fft[60:])  / 3000,  1.5)
-            return [bass, mids, highs]
+            
+            # Apply exponential moving average smoothing
+            new_bands = np.array([bass, mids, highs])
+            self.smoothed_bands = (self.smoothed_bands * self.smoothing_factor) + (new_bands * (1.0 - self.smoothing_factor))
+            
+            return self.smoothed_bands.tolist()
         except Exception:
             return [0.0, 0.0, 0.0]
 
