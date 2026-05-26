@@ -43,3 +43,4 @@ verify_stream.py
 inspect_engine.py
 builder.py
 recordings/
+midi_mappings.json

@@ -33,6 +33,7 @@ class Dreamer:
         self._host = host
         self._history_turns = history_turns
         self._temperature = temperature
+        self._keywords: str = ""
 
         self._history: list[dict] = []
         self._latest: str | None = None
@@ -72,6 +73,10 @@ class Dreamer:
         with self._lock:
             self._temperature = t
 
+    def set_keywords(self, keywords: str) -> None:
+        with self._lock:
+            self._keywords = keywords.strip()
+
     def reset(self) -> None:
         with self._lock:
             self._history.clear()
@@ -92,14 +97,23 @@ class Dreamer:
                 self._is_dreaming = True
                 model = self._model
                 temp = self._temperature
+                keywords = self._keywords
                 messages = [{"role": "system", "content": SYSTEM_PROMPT}]
                 # Keep only the most recent turns to bound context size.
                 tail = self._history[-(self._history_turns * 2):]
                 messages.extend(tail)
-                user_msg = (
+                base = (
                     "Continue the dream — describe the next scene."
                     if tail
                     else "Begin the dream — describe the first scene."
+                )
+                # Soft steering: append the keywords as influences, not hard
+                # constraints. The model gradually drifts toward them rather
+                # than restarting the dream.
+                user_msg = (
+                    f"{base} Lean toward these influences: {keywords}."
+                    if keywords
+                    else base
                 )
                 messages.append({"role": "user", "content": user_msg})
 

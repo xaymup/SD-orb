@@ -1,6 +1,13 @@
+import gc
+
 import torch
 import tensorrt as trt
-from diffusers import StableDiffusionPipeline, AutoencoderTiny, LCMScheduler
+from diffusers import (
+    AutoencoderKL,
+    AutoencoderTiny,
+    LCMScheduler,
+    StableDiffusionPipeline,
+)
 
 
 class StableTRT10Engine:
@@ -8,15 +15,60 @@ class StableTRT10Engine:
         self.embed_dim = embed_dim
         self.latent_h = latent_h
         self.latent_w = latent_w
-        logger = trt.Logger(trt.Logger.ERROR)
-        runtime = trt.Runtime(logger)
-        with open(path, "rb") as f:
-            self.engine = runtime.deserialize_cuda_engine(f.read())
-        self.context = self.engine.create_execution_context()
+        self._logger = trt.Logger(trt.Logger.ERROR)
+        self._runtime = trt.Runtime(self._logger)
         self.s_buf   = torch.empty((1, 4, latent_h, latent_w), dtype=torch.float32, device="cuda")
         self.t_buf   = torch.empty((1,),                       dtype=torch.float32, device="cuda")
         self.e_buf   = torch.empty((1, 77, embed_dim),         dtype=torch.float16, device="cuda")
         self.out_buf = torch.empty((1, 4, latent_h, latent_w), dtype=torch.float16, device="cuda")
+        self.engine = None
+        self.context = None
+        self._current_path: str | None = None
+        self.load(path)
+
+    def _deserialize(self, path: str):
+        with open(path, "rb") as f:
+            engine = self._runtime.deserialize_cuda_engine(f.read())
+        if engine is None:
+            free_gb = torch.cuda.mem_get_info()[0] / 1024 ** 3
+            raise RuntimeError(
+                f"TRT failed to deserialize {path} (free VRAM {free_gb:.1f} GB). "
+                f"Probable cause: out of GPU memory."
+            )
+        ctx = engine.create_execution_context()
+        if ctx is None:
+            raise RuntimeError(f"TRT create_execution_context returned None for {path}")
+        return engine, ctx
+
+    def load(self, path):
+        """Replace the active engine atomically. Releases the old engine first
+        (necessary on tight VRAM), then loads the new one. If loading fails,
+        attempts to restore the previously-active engine so the runtime keeps
+        going instead of crashing on a NoneType context next frame."""
+        previous_path = self._current_path
+
+        self.context = None
+        self.engine = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        try:
+            self.engine, self.context = self._deserialize(path)
+            self._current_path = path
+        except Exception as load_err:
+            self.engine = None
+            self.context = None
+            if previous_path and previous_path != path:
+                try:
+                    self.engine, self.context = self._deserialize(previous_path)
+                    self._current_path = previous_path
+                except Exception:
+                    self.engine = None
+                    self.context = None
+                    self._current_path = None
+            else:
+                self._current_path = None
+            raise load_err
 
     def __call__(self, latent_model_input, timestep, encoder_hidden_states):
         self.context.set_input_shape("sample",                 (1, 4, self.latent_h, self.latent_w))
@@ -53,11 +105,18 @@ class AIPipeline:
         self.pipe.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
         self.pipe.scheduler.set_timesteps(4, device="cuda")
 
-        # Full HyperVAE for both encode and decode. TAESD on encode caused
-        # subtle spatial distortion that washed out geometric warps when going
-        # back through the full VAE on decode — a mismatch in their latent
-        # spaces. Worth ~5ms per frame to keep the warp legible.
-        self.vae = self.pipe.vae
+        # Canonical SD 1.5 VAE for ALL models. The HyperVAE shipped with
+        # RealisticVision uses a slightly different latent distribution than
+        # vanilla SD 1.5; using it as the encoder for a DreamShaper or
+        # MeinaMix UNet produces out-of-distribution latents and the UNet
+        # outputs noise. sd-vae-ft-mse is the latent distribution every SD 1.5
+        # finetune was trained against, so it works for every engine in the
+        # model bank.
+        print("Loading canonical SD 1.5 VAE (sd-vae-ft-mse)...")
+        self.vae = AutoencoderKL.from_pretrained(
+            "stabilityai/sd-vae-ft-mse",
+            torch_dtype=torch.float16,
+        ).to("cuda")
 
         print("Loading TensorRT Engine...")
         self.unet_engine = StableTRT10Engine(
@@ -67,6 +126,14 @@ class AIPipeline:
         self.shared_noise = torch.randn(
             (1, 4, self.latent_h, self.latent_w), device="cuda", dtype=torch.float16,
         )
+        self.prev_output = None
+
+    def swap_engine(self, engine_path: str) -> None:
+        """Hot-swap the UNet engine without rebuilding the rest of the pipeline.
+        Text encoder, VAE, and scheduler are kept (they're identical across
+        SD 1.5 finetunes). Resets prev_output so a fresh style doesn't blend
+        through the temporal smooth from the old model."""
+        self.unet_engine.load(engine_path)
         self.prev_output = None
 
     def get_embeds(self, prompt):
@@ -84,6 +151,11 @@ class AIPipeline:
         input_image: (1, 3, H, W) float16 CUDA tensor in [0, 1].
         Returns:     (1, 3, H, W) float16 CUDA tensor in [0, 1].
         """
+        # Safety net: if a previous engine swap left the engine unloaded, just
+        # pass the warped input straight through this frame instead of
+        # dereferencing a NoneType context.
+        if self.unet_engine.context is None:
+            return input_image
         with torch.no_grad():
             x = input_image * 2.0 - 1.0
             init_latents = self.vae.encode(x).latent_dist.mode() * self.latent_scale

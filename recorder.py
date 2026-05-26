@@ -43,11 +43,31 @@ class Recorder:
             return 0.0
         return time.time() - self._start_time
 
-    def start(self, include_audio: bool = True) -> None:
+    @staticmethod
+    def default_sink_monitor() -> str | None:
+        """PulseAudio source name that captures whatever's playing on the
+        default speaker output (i.e. system audio, not the mic)."""
+        try:
+            sink = subprocess.run(
+                ["pactl", "get-default-sink"],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.strip()
+            return f"{sink}.monitor" if sink else None
+        except Exception:
+            return None
+
+    def start(self, include_audio: bool = True, audio_source: str = "system") -> None:
+        """audio_source: 'system' (loopback of speaker output) or 'mic'
+        (default input). Falls back to 'default' if monitor lookup fails."""
         if self._is_recording:
             return
         os.makedirs(self.output_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d-%H%M%S")
+
+        if audio_source == "system":
+            pulse_source = self.default_sink_monitor() or "default"
+        else:
+            pulse_source = "default"
 
         if include_audio:
             self._video_path = os.path.join(self.output_dir, f"{timestamp}_v.mp4")
@@ -85,7 +105,7 @@ class Recorder:
             audio_cmd = [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-f", "pulse",
-                "-i", "default",
+                "-i", pulse_source,
                 "-ac", "2",
                 "-ar", "44100",
                 "-c:a", "pcm_s16le",
