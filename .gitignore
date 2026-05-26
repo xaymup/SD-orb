@@ -42,3 +42,4 @@ test_*.py
 verify_stream.py
 inspect_engine.py
 builder.py
+recordings/
