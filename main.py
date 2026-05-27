@@ -66,7 +66,7 @@ audio = AudioAnalyzer()
 viz = Visualizer(WIDTH, HEIGHT)
 ai = AIPipeline(MODEL_PATH, ENGINE_PATH, width=WIDTH, height=HEIGHT)
 dreamer = Dreamer()
-recorder = Recorder(WIDTH, HEIGHT, fps=24)
+recorder = Recorder(WIDTH, HEIGHT, fps=30)
 midi = MidiController()
 
 # (tag, label, type, min, max). Buttons use ("trigger" routing in apply_midi).
@@ -78,6 +78,8 @@ MIDI_CONTROLS = [
     ("zoom_sens_sl",    "Zoom React",       "slider",   0.0,  2.0),
     ("rot_base_sl",     "Rotate Base",      "slider",  -0.1,  0.1),
     ("rot_sens_sl",     "Rotate React",     "slider",   0.0,  2.0),
+    ("kaleido_base_sl", "Kaleido Base",     "slider",   0.0,  1.0),
+    ("kaleido_sens_sl", "Kaleido React",    "slider",   0.0,  2.0),
     ("interval_sl",     "Switch Interval",  "slider",   5.0,  300.0),
     ("dream_temp_sl",   "Dream Temp",       "slider",   0.3,  1.6),
     ("auto_sw_cb",      "Auto Switch",      "checkbox", 0,    1),
@@ -291,6 +293,18 @@ with dpg.window(label="113.RECURSIVE AI — Modular RV6", width=350 + DISPLAY_W 
                     dpg.add_slider_float(label="Zoom React",    tag="zoom_sens_sl",  min_value=0.0, max_value=2.0,  default_value=1.0)
                     dpg.add_slider_float(label="Rotate Base",    tag="rot_base_sl",   min_value=-0.1, max_value=0.1, default_value=0.01)
                     dpg.add_slider_float(label="Rotate React",  tag="rot_sens_sl",   min_value=0.0, max_value=2.0,  default_value=1.0)
+                    dpg.add_combo(
+                        items=["Off", "Mirror-fold", "Anisotropic stretch", "Stretch-in-folds"],
+                        default_value="Off",
+                        label="Kaleido Mode", tag="kaleido_mode_combo",
+                    )
+                    dpg.add_combo(
+                        items=["Bass", "Mids", "Highs"],
+                        default_value="Bass",
+                        label="Kaleido Band", tag="kaleido_band_combo",
+                    )
+                    dpg.add_slider_float(label="Kaleido Base",   tag="kaleido_base_sl", min_value=0.0, max_value=1.0, default_value=0.0)
+                    dpg.add_slider_float(label="Kaleido React",  tag="kaleido_sens_sl", min_value=0.0, max_value=2.0, default_value=1.0)
 
                 with dpg.collapsing_header(label="Recording", default_open=False):
                     def _toggle_record(s, a, u):
@@ -416,10 +430,14 @@ while dpg.is_dearpygui_running():
     bands = audio.get_bands()
 
     viz_config = {
-        'zoom_base': dpg.get_value("zoom_base_sl"),
-        'zoom_sens': dpg.get_value("zoom_sens_sl"),
-        'rot_base':  dpg.get_value("rot_base_sl"),
-        'rot_sens':  dpg.get_value("rot_sens_sl"),
+        'zoom_base':     dpg.get_value("zoom_base_sl"),
+        'zoom_sens':     dpg.get_value("zoom_sens_sl"),
+        'rot_base':      dpg.get_value("rot_base_sl"),
+        'rot_sens':      dpg.get_value("rot_sens_sl"),
+        'kaleido_mode':  dpg.get_value("kaleido_mode_combo"),
+        'kaleido_band':  dpg.get_value("kaleido_band_combo"),
+        'kaleido_base':  dpg.get_value("kaleido_base_sl"),
+        'kaleido_sens':  dpg.get_value("kaleido_sens_sl"),
     }
     img_tensor = viz.apply_feedback(ai_tensor, bands, viz_config)
     warp_diff = (img_tensor - ai_tensor).abs().mean().item()
