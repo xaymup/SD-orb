@@ -53,18 +53,32 @@ BASE_SYSTEM_PROMPT = (
 )
 
 
-def build_system_prompt(style_hint: str | None) -> str:
-    """Inject the active model's style register so the dreamer biases its
-    sensory grit toward what the current SD checkpoint + LoRAs render well.
-    Empty hint means generic — leave the base prompt alone."""
-    if not style_hint:
-        return BASE_SYSTEM_PROMPT
-    return (
-        BASE_SYSTEM_PROMPT
-        + f"\n\nActive visual register: {style_hint}. Lean the sensory grit "
-        "toward this register — pick textures, lighting, and degradation "
-        "that suit it. Still 10 words or fewer."
-    )
+def build_system_prompt(style_hint: str | None, keywords: str | None = None) -> str:
+    """Inject the active SD style register + the user's influence list into
+    the system prompt. Both are constraints, not hints — they go in the
+    system message so the LLM weighs them above turn-by-turn nudges.
+
+    Putting keywords here (instead of as a "lean toward" suffix on the user
+    message) is the difference between the LLM treating them as a soft
+    suggestion vs. an active rule. The "bold leaps" instruction in the
+    base prompt makes the soft path almost invisible — the LLM picks its
+    own examples over the user's."""
+    parts = [BASE_SYSTEM_PROMPT]
+    if style_hint:
+        parts.append(
+            f"\n\nActive visual register: {style_hint}. Lean the sensory grit "
+            "toward this register — pick textures, lighting, and degradation "
+            "that suit it. Still 10 words or fewer."
+        )
+    if keywords:
+        parts.append(
+            f"\n\nACTIVE INFLUENCES (use these every turn): {keywords}. Every "
+            "dream MUST integrate at least one of these — as a texture, "
+            "subject, environment, or framing device. Translate them into "
+            "the sensory grammar above (don't list them verbatim as tags). "
+            "If a turn drifts off these influences, pull it back next turn."
+        )
+    return "".join(parts)
 
 
 class Dreamer:
@@ -172,22 +186,16 @@ class Dreamer:
                 cpu_only = self._cpu_only
                 keywords = self._keywords
                 style_hint = self._style_hint
-                messages = [{"role": "system", "content": build_system_prompt(style_hint)}]
+                # Keywords are baked into the system prompt now — much more
+                # weight than a soft "lean toward" suffix on the user msg.
+                messages = [{"role": "system", "content": build_system_prompt(style_hint, keywords)}]
                 # Keep only the most recent turns to bound context size.
                 tail = self._history[-(self._history_turns * 2):]
                 messages.extend(tail)
-                base = (
-                    "Continue the dream — describe the next scene."
-                    if tail
-                    else "Begin the dream — describe the first scene."
-                )
-                # Soft steering: append the keywords as influences, not hard
-                # constraints. The model gradually drifts toward them rather
-                # than restarting the dream.
                 user_msg = (
-                    f"{base} Lean toward these influences: {keywords}."
-                    if keywords
-                    else base
+                    "Continue the dream — next scene. Remember the active influences."
+                    if tail
+                    else "Begin the dream — first scene. Remember the active influences."
                 )
                 messages.append({"role": "user", "content": user_msg})
 
