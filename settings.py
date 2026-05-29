@@ -16,8 +16,17 @@ def load() -> dict:
 
 
 def save(data: dict) -> None:
+    # Atomic write: dump to a sibling tmp file, then os.replace (atomic on
+    # POSIX). A crash mid-dump leaves the previous settings.json untouched
+    # rather than truncated/corrupt.
+    tmp = PATH + ".tmp"
     try:
-        with open(PATH, "w") as f:
+        with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp, PATH)
     except Exception as e:
         print(f"[settings] save error: {e}")
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass

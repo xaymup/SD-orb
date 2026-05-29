@@ -309,7 +309,10 @@ def apply_midi_updates():
                     if dpg.does_item_exist("record_btn"):
                         dpg.set_item_label("record_btn", "■ Stop Recording")
             elif tag == "dream_reset":
-                dreamer.reset()
+                # _reset_dream is defined inside the Dream tab and lives at
+                # module scope (with-blocks don't introduce scopes), so it's
+                # resolvable by the time MIDI events flow.
+                _reset_dream()
             continue
 
         # Toggle (note-on on a checkbox)
@@ -534,7 +537,22 @@ with dpg.window(label="113.RECURSIVE AI — Modular RV6", tag="main_window", wid
                         dpg.add_text("Current dream:")
                         dpg.add_text("(idle)", tag="dream_text", wrap=320)
                         dpg.add_text("", tag="dream_status", color=(200, 160, 80))
-                        dpg.add_button(label="Reset Dream", callback=lambda: dreamer.reset(), width=-1)
+
+                        def _reset_dream():
+                            # Clear LLM history + cached dream so the next
+                            # generation starts fresh. Reset the visible
+                            # text so the click feels like it did something
+                            # (otherwise dream_text keeps the last value
+                            # since the live-update branch skips on None).
+                            # Kick off a new dream immediately if Deep
+                            # Dream is on, so the cycle restarts without
+                            # waiting for the next interval / manual click.
+                            dreamer.reset()
+                            if dpg.does_item_exist("dream_text"):
+                                dpg.set_value("dream_text", "(idle)")
+                            if state["deep_dream"]:
+                                dreamer.request_dream()
+                        dpg.add_button(label="Reset Dream", callback=lambda: _reset_dream(), width=-1)
 
                     # ---------------------------------------------- Devices
                     with dpg.tab(label="Devices"):
@@ -878,6 +896,19 @@ fps_t0 = time.time()
 while dpg.is_dearpygui_running():
     if state["auto_switch"] and (time.time() - state["last_switch"] > state["switch_interval"]):
         next_prompt()
+
+    # Deep Dream auto-promote: when active, every fresh dream becomes the
+    # SD prompt. The LLM is the prompt source, so its cadence — not the
+    # auto-switch interval — drives the rhythm. Without this, with
+    # auto-switch off, dreams accumulate in dreamer.latest_dream without
+    # ever reaching the pipeline.
+    if state["deep_dream"]:
+        latest = dreamer.latest_dream
+        if latest and latest != state["current_p"]:
+            update_embeds(latest)
+            dpg.set_value("prompt_in", latest)
+            dreamer.request_dream()
+            state["last_switch"] = time.time()
 
     apply_midi_updates()
 

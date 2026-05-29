@@ -1,7 +1,20 @@
+import re
 import threading
 import time
 
 import requests
+
+# Strip trailing parenthetical meta the LLM leaks despite being told not to:
+# "(8 words)", "(word count: 9)", "(Word Count - 7)", "(words: 6)". End-
+# anchored so legitimate inline parens are safe.
+_META_RE = re.compile(
+    r"\s*\(\s*(?:"
+    r"\d+\s*words?\.?"            # 8 words
+    r"|word\s*count[:\-=\s]*\d+"   # word count: 5, Word Count - 6
+    r"|words?[:\-=\s]+\d+"         # words: 8
+    r")\s*\)\s*$",
+    re.IGNORECASE,
+)
 
 BASE_SYSTEM_PROMPT = (
     "You are a dreaming mind generating Stable Diffusion 1.5 prompts for "
@@ -22,10 +35,18 @@ BASE_SYSTEM_PROMPT = (
     "cinematic, beautiful, stunning, professional, breathtaking, "
     "atmospheric, epic. These are empty noise and degrade LCM output.\n"
     "\n"
-    "Each turn drifts from the previous: swap one texture, shift the "
-    "light source, deepen the degradation. Do not reset the scene.\n"
+    "Each turn EVOLVES the dream — sometimes a small swap (texture, "
+    "lighting), often a bold leap (new subject, new environment, "
+    "unexpected pairing). Welcome surprise. Drag the imagery into "
+    "stranger territory: hybrid creatures, impossible architecture, "
+    "ruined sacred objects, scenes from invented decades. The thread "
+    "between turns is mood and sensory grammar, NOT literal similarity. "
+    "Do not loop, do not repeat tags from recent turns, do not settle "
+    "into a comfortable subject — keep mutating.\n"
     "\n"
-    "Count the words before responding. If over 10, cut filler. Examples:\n"
+    "Output ONLY the comma-separated tags. No preamble, no commentary, "
+    "no parentheses, no word counts, no notes — just the tags. Examples "
+    "of valid replies:\n"
     "  wet asphalt subway, flickering tubes, chromatic bleed\n"
     "  rusted chrome bust, VHS tracking, dying CRT glow\n"
     "  torn silk dress, sodium glare, film scratch, ash haze"
@@ -196,6 +217,10 @@ class Dreamer:
                 content = data.get("message", {}).get("content", "").strip()
                 # Strip wrapping quotes/backticks/markdown the model sometimes adds.
                 content = content.strip('"\'` \n\t').replace("\n", " ").strip()
+                # Strip parenthetical word-count meta the model leaks even
+                # after being told not to. Belt-and-suspenders with the
+                # system prompt — the prompt usually wins but not always.
+                content = _META_RE.sub("", content).strip().rstrip(",").strip()
                 if not content:
                     raise RuntimeError("empty response from Ollama")
 
