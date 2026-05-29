@@ -72,11 +72,14 @@ def build_system_prompt(style_hint: str | None, keywords: str | None = None) -> 
         )
     if keywords:
         parts.append(
-            f"\n\nACTIVE INFLUENCES (use these every turn): {keywords}. Every "
-            "dream MUST integrate at least one of these — as a texture, "
-            "subject, environment, or framing device. Translate them into "
-            "the sensory grammar above (don't list them verbatim as tags). "
-            "If a turn drifts off these influences, pull it back next turn."
+            f"\n\nACTIVE INFLUENCES (use these every turn): {keywords}. Make "
+            "ONE of these the CONCRETE SUBJECT of the scene most turns — the "
+            "literal thing, named directly. The other tags (texture, "
+            "lighting, degradation) DRESS the subject, they don't replace "
+            "it. Don't smuggle the influence in as a decorative modifier "
+            "('feathered car') when it should be the subject itself ('crow', "
+            "'pigeon flock', 'starling murmuration'). Pick a different "
+            "specific instance each turn to keep the dream evolving."
         )
     return "".join(parts)
 
