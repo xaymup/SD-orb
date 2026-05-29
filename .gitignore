@@ -44,3 +44,4 @@ inspect_engine.py
 builder.py
 recordings/
 midi_mappings.json
+settings.json

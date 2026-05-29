@@ -1,4 +1,5 @@
 import gc
+import threading
 
 import torch
 import tensorrt as trt
@@ -86,7 +87,15 @@ class StableTRT10Engine:
 
 
 class AIPipeline:
-    def __init__(self, model_path, engine_path, width=512, height=512, latent_scale=0.18215):
+    def __init__(
+        self,
+        model_path,
+        engine_path,
+        width=512,
+        height=512,
+        latent_scale=0.18215,
+        loras: list[tuple[str, float]] | None = None,
+    ):
         self.latent_scale = latent_scale
         self.latent_h = height // 8
         self.latent_w = width // 8
@@ -96,12 +105,19 @@ class AIPipeline:
             model_path,
             torch_dtype=torch.float16,
             safety_checker=None,
+            load_safety_checker=False,  # else the 1.2 GB checker is fetched
             use_safetensors=True,
         ).to("cuda")
 
-        print("Loading LCM LoRA...")
-        self.pipe.load_lora_weights("latent-consistency/lcm-lora-sdv1-5")
-        self.pipe.fuse_lora()
+        # Critical: fuse LCM LoRA (and any style LoRAs baked into the engine)
+        # into the text encoder. At build time, every engine was compiled
+        # against a text encoder with this exact LoRA stack fused. If we feed
+        # them embeddings from an unfused (or differently-fused) text encoder,
+        # the model's internal attention sees out-of-distribution conditioning
+        # and the output devolves into noise. The UNet fuse is wasted (we
+        # replace it with the TRT engine) but harmless.
+        print("Fusing LCM + style LoRAs into text encoder...")
+        self._fuse_loras_into_pipe(self.pipe, loras or [])
         self.pipe.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
         self.pipe.scheduler.set_timesteps(4, device="cuda")
 
@@ -128,13 +144,76 @@ class AIPipeline:
         )
         self.prev_output = None
 
-    def swap_engine(self, engine_path: str) -> None:
-        """Hot-swap the UNet engine without rebuilding the rest of the pipeline.
-        Text encoder, VAE, and scheduler are kept (they're identical across
-        SD 1.5 finetunes). Resets prev_output so a fresh style doesn't blend
-        through the temporal smooth from the old model."""
-        self.unet_engine.load(engine_path)
-        self.prev_output = None
+        # Per-engine text encoder cache. Each engine was compiled against its
+        # own model's text encoder with a specific LoRA stack fused (LCM +
+        # optional style LoRAs). Two engines that share a base checkpoint but
+        # have different LoRAs still need DIFFERENT text encoders, so the key
+        # includes the LoRA tuple — not just the checkpoint path.
+        self._te_cache: dict[tuple, object] = {}
+        # Held during swap_engine; step() try-acquires and bypasses if held.
+        # Prevents step() from running with a half-swapped engine state.
+        self._swap_lock = threading.Lock()
+
+    @staticmethod
+    def _fuse_loras_into_pipe(pipe, loras: list[tuple[str, float]]) -> None:
+        """Fuse LCM LoRA followed by style LoRAs into pipe in place. Each fuse
+        bakes the delta into the weights and is then unloaded so the next LoRA
+        loads cleanly. Order and scales must match what builder.py used or the
+        text encoder won't match the compiled engine."""
+        pipe.load_lora_weights("latent-consistency/lcm-lora-sdv1-5")
+        pipe.fuse_lora()
+        pipe.unload_lora_weights()
+        for lora_path, scale in loras:
+            pipe.load_lora_weights(lora_path)
+            pipe.fuse_lora(lora_scale=scale)
+            pipe.unload_lora_weights()
+
+    def swap_engine(
+        self,
+        engine_path: str,
+        checkpoint_path: str | None = None,
+        loras: list[tuple[str, float]] | None = None,
+    ) -> None:
+        """Hot-swap the UNet engine. If checkpoint_path is provided, also swap
+        the text encoder to one built from that checkpoint with the given
+        LoRA stack fused, matching what the engine was compiled against.
+        Order: load text encoder first (additive, safe to fail), then swap
+        engine (releases old, may fail), then install text encoder. The whole
+        operation is locked so step() can't run mid-swap."""
+        loras = loras or []
+        with self._swap_lock:
+            # 1. Load new text encoder up-front. If this OOMs or otherwise
+            # fails, we haven't touched the engine yet.
+            new_te = None
+            if checkpoint_path is not None:
+                cache_key = (checkpoint_path, tuple(loras))
+                if cache_key not in self._te_cache:
+                    label = checkpoint_path + (
+                        " + " + ", ".join(f"{p}@{s}" for p, s in loras) if loras else ""
+                    )
+                    print(f"Loading text encoder for {label}…")
+                    tmp_pipe = StableDiffusionPipeline.from_single_file(
+                        checkpoint_path,
+                        torch_dtype=torch.float16,
+                        safety_checker=None,
+                        load_safety_checker=False,
+                        use_safetensors=checkpoint_path.endswith(".safetensors"),
+                    ).to("cuda")
+                    self._fuse_loras_into_pipe(tmp_pipe, loras)
+                    self._te_cache[cache_key] = tmp_pipe.text_encoder
+                    del tmp_pipe
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                new_te = self._te_cache[cache_key]
+
+            # 2. Swap engine (atomic with restore-on-failure inside load()).
+            self.unet_engine.load(engine_path)
+
+            # 3. Install matching text encoder.
+            if new_te is not None:
+                self.pipe.text_encoder = new_te
+
+            self.prev_output = None
 
     def get_embeds(self, prompt):
         tokens = self.pipe.tokenizer(
@@ -146,44 +225,61 @@ class AIPipeline:
         ).to("cuda")
         return self.pipe.text_encoder(tokens.input_ids)[0].half()
 
-    def step(self, input_image, embeds, strength, delta):
+    def step(self, input_image, embeds, strength, delta,
+             neg_embeds=None, neg_strength=0.0):
         """
         input_image: (1, 3, H, W) float16 CUDA tensor in [0, 1].
         Returns:     (1, 3, H, W) float16 CUDA tensor in [0, 1].
+
+        neg_embeds + neg_strength implement embedding-space negative prompts:
+        eff = pos + α·(pos − neg), pushing the conditioning AWAY from the
+        negative direction in CLIP space. This is cheaper than true CFG
+        (which would need a second UNet pass and halve FPS) and the only
+        option that fits the batch=1 TRT engine without recompiling. Effect
+        is weaker than CFG but it's free.
         """
-        # Safety net: if a previous engine swap left the engine unloaded, just
-        # pass the warped input straight through this frame instead of
-        # dereferencing a NoneType context.
-        if self.unet_engine.context is None:
+        # If a swap is in flight, bypass UNet for this frame — the engine
+        # and text encoder are momentarily inconsistent.
+        if not self._swap_lock.acquire(blocking=False):
             return input_image
-        with torch.no_grad():
-            x = input_image * 2.0 - 1.0
-            init_latents = self.vae.encode(x).latent_dist.mode() * self.latent_scale
+        try:
+            if self.unet_engine.context is None:
+                return input_image
+            with torch.no_grad():
+                x = input_image * 2.0 - 1.0
+                init_latents = self.vae.encode(x).latent_dist.mode() * self.latent_scale
 
-            # Fixed mid-range noise level — strength is handled in image space below.
-            t = self.pipe.scheduler.timesteps[2]
-            noised_latents = self.pipe.scheduler.add_noise(init_latents, self.shared_noise, t.unsqueeze(0))
-            latent_model_input = self.pipe.scheduler.scale_model_input(noised_latents, t)
+                # Fixed mid-range noise level — strength is handled in image space below.
+                t = self.pipe.scheduler.timesteps[2]
+                noised_latents = self.pipe.scheduler.add_noise(init_latents, self.shared_noise, t.unsqueeze(0))
+                latent_model_input = self.pipe.scheduler.scale_model_input(noised_latents, t)
 
-            model_output = self.unet_engine(
-                latent_model_input.float(),
-                t.unsqueeze(0).float(),
-                embeds.half(),
-            ).half()
+                if neg_embeds is not None and neg_strength > 0.0:
+                    effective_embeds = embeds + neg_strength * (embeds - neg_embeds)
+                else:
+                    effective_embeds = embeds
 
-            out = self.pipe.scheduler.step(model_output, t, noised_latents)
-            x0_pred = out.denoised if hasattr(out, 'denoised') else out.prev_sample
+                model_output = self.unet_engine(
+                    latent_model_input.float(),
+                    t.unsqueeze(0).float(),
+                    effective_embeds.half(),
+                ).half()
 
-            decoded = self.vae.decode(x0_pred / self.latent_scale).sample
-            ai_image = (decoded / 2 + 0.5).clamp(0, 1)
+                out = self.pipe.scheduler.step(model_output, t, noised_latents)
+                x0_pred = out.denoised if hasattr(out, 'denoised') else out.prev_sample
 
-            # Blend in IMAGE space — linear in pixels, so the spatial warp from
-            # the visualizer is preserved at (1-strength) weight directly.
-            output = torch.lerp(input_image, ai_image, strength)
+                decoded = self.vae.decode(x0_pred / self.latent_scale).sample
+                ai_image = (decoded / 2 + 0.5).clamp(0, 1)
 
-            # Temporal smooth also in image space.
-            if self.prev_output is not None:
-                output = torch.lerp(output, self.prev_output, delta)
-            self.prev_output = output.detach()
+                # Blend in IMAGE space — linear in pixels, so the spatial warp from
+                # the visualizer is preserved at (1-strength) weight directly.
+                output = torch.lerp(input_image, ai_image, strength)
 
-            return output
+                # Temporal smooth also in image space.
+                if self.prev_output is not None:
+                    output = torch.lerp(output, self.prev_output, delta)
+                self.prev_output = output.detach()
+
+                return output
+        finally:
+            self._swap_lock.release()

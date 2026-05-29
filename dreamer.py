@@ -3,14 +3,47 @@ import time
 
 import requests
 
-SYSTEM_PROMPT = (
-    "You are a dreaming mind. Each turn, respond with exactly one Stable "
-    "Diffusion prompt describing the next vivid scene in the dream. Visual "
-    "description only: subject, environment, mood, lighting, art style. "
-    "Under 200 characters. No quotes, no narration, no numbering — just the "
-    "prompt. Each scene should drift from the previous one: the same setting "
-    "twisted, an object transformed, the light shifting. Don't reset the dream."
+BASE_SYSTEM_PROMPT = (
+    "You are a dreaming mind generating Stable Diffusion 1.5 prompts for "
+    "real-time LCM inference. Output ONE prompt per turn: comma-separated "
+    "tags, 10 WORDS OR FEWER total. No labels, quotes, numbering, "
+    "narration, or full sentences.\n"
+    "\n"
+    "Aesthetic: raw, chaotic, hallucinatory scenes built from SENSORY "
+    "specifics — TEXTURE (wet asphalt, cracked vinyl, oily film, ash "
+    "crust, rust bloom, frayed silk, melted plastic), LIGHTING "
+    "(flickering tube, blown flash, sodium glare, dying CRT, undercaught "
+    "backlight, dawn sodium), and DEGRADATION (chromatic bleed, film "
+    "scratch, VHS tracking, halftone rot, JPEG smear, photocopy grain). "
+    "One concrete subject anchors the scene; the rest is grit.\n"
+    "\n"
+    "FORBIDDEN — never use: 8k, 4k, ultra detailed, hyperrealistic, "
+    "masterpiece, best quality, highly detailed, intricate, sharp focus, "
+    "cinematic, beautiful, stunning, professional, breathtaking, "
+    "atmospheric, epic. These are empty noise and degrade LCM output.\n"
+    "\n"
+    "Each turn drifts from the previous: swap one texture, shift the "
+    "light source, deepen the degradation. Do not reset the scene.\n"
+    "\n"
+    "Count the words before responding. If over 10, cut filler. Examples:\n"
+    "  wet asphalt subway, flickering tubes, chromatic bleed\n"
+    "  rusted chrome bust, VHS tracking, dying CRT glow\n"
+    "  torn silk dress, sodium glare, film scratch, ash haze"
 )
+
+
+def build_system_prompt(style_hint: str | None) -> str:
+    """Inject the active model's style register so the dreamer biases its
+    sensory grit toward what the current SD checkpoint + LoRAs render well.
+    Empty hint means generic — leave the base prompt alone."""
+    if not style_hint:
+        return BASE_SYSTEM_PROMPT
+    return (
+        BASE_SYSTEM_PROMPT
+        + f"\n\nActive visual register: {style_hint}. Lean the sensory grit "
+        "toward this register — pick textures, lighting, and degradation "
+        "that suit it. Still 10 words or fewer."
+    )
 
 
 class Dreamer:
@@ -27,12 +60,15 @@ class Dreamer:
         host: str = "http://localhost:11434",
         history_turns: int = 8,
         temperature: float = 1.1,
+        cpu_only: bool = True,
     ):
         self._model = model
         self._host = host
         self._history_turns = history_turns
         self._temperature = temperature
+        self._cpu_only = cpu_only
         self._keywords: str = ""
+        self._style_hint: str = ""
 
         self._history: list[dict] = []
         self._latest: str | None = None
@@ -72,9 +108,25 @@ class Dreamer:
         with self._lock:
             self._temperature = t
 
+    def set_cpu_only(self, value: bool) -> None:
+        with self._lock:
+            self._cpu_only = bool(value)
+
     def set_keywords(self, keywords: str) -> None:
         with self._lock:
             self._keywords = keywords.strip()
+
+    def set_style(self, style_hint: str) -> None:
+        """Update the visual register the dreamer biases toward. Called when
+        the SD model changes so dreams shift aesthetically alongside the
+        renderer. Clears history because the prior turns were written under a
+        different aesthetic and seeing them would anchor the LLM back."""
+        hint = (style_hint or "").strip()
+        with self._lock:
+            if hint == self._style_hint:
+                return
+            self._style_hint = hint
+            self._history.clear()
 
     def reset(self) -> None:
         with self._lock:
@@ -96,8 +148,10 @@ class Dreamer:
                 self._is_dreaming = True
                 model = self._model
                 temp = self._temperature
+                cpu_only = self._cpu_only
                 keywords = self._keywords
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                style_hint = self._style_hint
+                messages = [{"role": "system", "content": build_system_prompt(style_hint)}]
                 # Keep only the most recent turns to bound context size.
                 tail = self._history[-(self._history_turns * 2):]
                 messages.extend(tail)
@@ -116,6 +170,16 @@ class Dreamer:
                 )
                 messages.append({"role": "user", "content": user_msg})
 
+            # num_gpu=0 forces Ollama to load llama on CPU. The render loop
+            # shares the GPU with SD inference; full-GPU llama generation
+            # contends for SMs and visibly drops FPS during the ~1-3 s the
+            # response is being produced. CPU generation takes a few seconds
+            # but the dream is queued one switch interval ahead, so the extra
+            # latency is invisible.
+            options = {"temperature": temp}
+            if cpu_only:
+                options["num_gpu"] = 0
+
             try:
                 response = requests.post(
                     f"{self._host}/api/chat",
@@ -123,9 +187,9 @@ class Dreamer:
                         "model": model,
                         "messages": messages,
                         "stream": False,
-                        "options": {"temperature": temp},
+                        "options": options,
                     },
-                    timeout=60,
+                    timeout=120 if cpu_only else 60,
                 )
                 response.raise_for_status()
                 data = response.json()

@@ -29,6 +29,13 @@ class Recorder:
         self._is_recording = False
         self._last_message: str = ""
         self._lock = threading.Lock()
+        self._active_size: tuple[int, int] = (width, height)
+
+    @property
+    def active_size(self) -> tuple[int, int]:
+        """Frame dimensions ffmpeg is currently expecting. Used by callers
+        to validate they're sending correctly-sized frames after a toggle."""
+        return self._active_size
 
     @property
     def is_recording(self) -> bool:
@@ -56,14 +63,29 @@ class Recorder:
         except Exception:
             return None
 
-    def start(self, include_audio: bool = True, audio_source: str = "system") -> None:
+    def start(
+        self,
+        include_audio: bool = True,
+        audio_source: str = "system",
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
         """audio_source: 'system' (loopback of speaker output) or 'mic'
-        (default input). Falls back to video-only if pulse lookup fails."""
+        (default input). Falls back to video-only if pulse lookup fails.
+
+        width/height override the init defaults for THIS recording. Lets the
+        recorder follow the upscaler's output size when GPU upscale is on,
+        without re-instantiating the Recorder. The chosen size sticks for the
+        whole take — ffmpeg's rawvideo input can't change resolution mid-stream."""
         if self._is_recording:
             return
         os.makedirs(self.output_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         self._final_path = os.path.join(self.output_dir, f"{timestamp}.mp4")
+
+        active_w = int(width) if width else self.width
+        active_h = int(height) if height else self.height
+        self._active_size = (active_w, active_h)
 
         pulse_source: str | None = None
         if include_audio:
@@ -87,7 +109,7 @@ class Recorder:
             "-thread_queue_size", "1024",
             "-f", "rawvideo",
             "-pixel_format", "rgb24",
-            "-video_size", f"{self.width}x{self.height}",
+            "-video_size", f"{active_w}x{active_h}",
             "-framerate", str(self.fps),
             "-use_wallclock_as_timestamps", "1",
             "-i", "-",
